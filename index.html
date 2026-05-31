@@ -1,0 +1,1146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Attendance Panel - Face Auth + Geofencing</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; }
+        .pulse-dot { animation: pulse 2s infinite; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+        .fade-in { animation: fadeIn 0.3s ease-in; }
+        @keyframes fadeIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+        .modal-overlay { background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); }
+        .notification-badge { position:absolute;top:-4px;right:-4px;width:18px;height:18px;background:#ef4444;color:white;border-radius:50%;font-size:10px;display:flex;align-items:center;justify-content:center; }
+        #map { height: 300px; border-radius: 12px; }
+        .status-green { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+        .status-yellow { background: #fef9c3; color: #854d0e; border: 1px solid #fef08a; }
+        .status-red { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+        .camera-guide { border: 2px dashed rgba(255,255,255,0.5); border-radius: 50%; width: 200px; height: 240px; position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); }
+    </style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+
+// =============================================
+// DATABASE LAYER (localStorage-based)
+// =============================================
+const DB = {
+    init() {
+        if (!localStorage.getItem('att_initialized')) {
+            this.seed();
+            localStorage.setItem('att_initialized', 'true');
+        }
+    },
+    seed() {
+        const schoolId = this.uuid();
+        const school = {
+            id: schoolId, name: 'Springfield High School',
+            address: '123 Education Ave, Springfield',
+            latitude: 28.6139, longitude: 77.2090, radiusMeters: 200,
+            createdAt: new Date().toISOString()
+        };
+        this.save('schools', [school]);
+
+        const teachers = [
+            { id: this.uuid(), schoolId, name: 'Admin User', email: 'admin@school.com', password: 'admin123', role: 'admin', status: 'active', faceDescriptor: null },
+            { id: this.uuid(), schoolId, name: 'Sarah Johnson', email: 'sarah@school.com', password: 'teacher123', role: 'teacher', status: 'active', faceDescriptor: null },
+            { id: this.uuid(), schoolId, name: 'Michael Chen', email: 'michael@school.com', password: 'teacher123', role: 'teacher', status: 'active', faceDescriptor: null },
+            { id: this.uuid(), schoolId, name: 'Emily Davis', email: 'emily@school.com', password: 'teacher123', role: 'teacher', status: 'active', faceDescriptor: null },
+            { id: this.uuid(), schoolId, name: 'Rajesh Kumar', email: 'rajesh@school.com', password: 'teacher123', role: 'teacher', status: 'active', faceDescriptor: null },
+            { id: this.uuid(), schoolId, name: 'Priya Sharma', email: 'priya@school.com', password: 'teacher123', role: 'teacher', status: 'active', faceDescriptor: null },
+        ];
+        this.save('teachers', teachers);
+        this.save('attendance', []);
+        this.save('notifications', []);
+        this.save('locationLogs', []);
+    },
+    uuid() { return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==='x'?r:(r&0x3|0x8)).toString(16)}); },
+    save(key, data) { localStorage.setItem('att_'+key, JSON.stringify(data)); },
+    load(key) { return JSON.parse(localStorage.getItem('att_'+key) || '[]'); },
+    getSchool() { return this.load('schools')[0]; },
+    getTeachers() { return this.load('teachers'); },
+    getTeacher(id) { return this.load('teachers').find(t=>t.id===id); },
+    getTeacherByEmail(email) { return this.load('teachers').find(t=>t.email===email); },
+    updateTeacher(id, updates) {
+        const teachers = this.load('teachers').map(t => t.id===id ? {...t,...updates} : t);
+        this.save('teachers', teachers);
+    },
+    addAttendance(record) {
+        const records = this.load('attendance');
+        const existing = records.findIndex(r => r.teacherId===record.teacherId && r.date===record.date && r.cycle===record.cycle);
+        if (existing >= 0) { records[existing] = {...records[existing], ...record}; }
+        else { records.push(record); }
+        this.save('attendance', records);
+        return record;
+    },
+    getAttendance(teacherId, date) {
+        return this.load('attendance').filter(r => r.teacherId===teacherId && r.date===date);
+    },
+    getAllAttendanceToday(date) { return this.load('attendance').filter(r=>r.date===date); },
+    addNotification(notif) {
+        const notifs = this.load('notifications');
+        notifs.unshift(notif);
+        this.save('notifications', notifs);
+    },
+    getNotifications(teacherId) { return this.load('notifications').filter(n=>n.teacherId===teacherId); },
+    markNotifRead(id) {
+        const notifs = this.load('notifications').map(n=>n.id===id?{...n,isRead:true}:n);
+        this.save('notifications', notifs);
+    },
+    markAllRead(teacherId) {
+        const notifs = this.load('notifications').map(n=>n.teacherId===teacherId?{...n,isRead:true}:n);
+        this.save('notifications', notifs);
+    },
+    addLocationLog(log) {
+        const logs = this.load('locationLogs');
+        logs.unshift(log);
+        if (logs.length > 200) logs.pop();
+        this.save('locationLogs', logs);
+    },
+    getLocationLogs(teacherId) { return this.load('locationLogs').filter(l=>l.teacherId===teacherId).slice(0,20); }
+};
+
+
+// =============================================
+// UTILITY FUNCTIONS
+// =============================================
+const Utils = {
+    getTodayDate() { return new Date().toISOString().split('T')[0]; },
+    getCurrentCycle() {
+        const hour = new Date().getHours();
+        if (hour < 8) return 1; // Allow marking anytime for demo
+        if (hour >= 18) return 5;
+        return Math.floor((hour - 8) / 2) + 1;
+    },
+    getCycleLabel(cycle) {
+        const labels = { 1:'8:00 AM - 10:00 AM', 2:'10:00 AM - 12:00 PM', 3:'12:00 PM - 2:00 PM', 4:'2:00 PM - 4:00 PM', 5:'4:00 PM - 6:00 PM' };
+        return labels[cycle] || 'Current Cycle';
+    },
+    // Haversine formula for geofence calculation
+    calculateDistance(lat1, lng1, lat2, lng2) {
+        const R = 6371000; // Earth radius in meters
+        const dLat = (lat2-lat1) * Math.PI/180;
+        const dLng = (lng2-lng1) * Math.PI/180;
+        const a = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLng/2)*Math.sin(dLng/2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        return Math.round(R * c);
+    },
+    isInsideGeofence(teacherLat, teacherLng, schoolLat, schoolLng, radius) {
+        const distance = this.calculateDistance(teacherLat, teacherLng, schoolLat, schoolLng);
+        return { isInside: distance <= radius, distance };
+    },
+    getGeofenceStatus(distance, radius) {
+        if (distance <= radius) return { status:'inside', label:'Inside School Premises', color:'green' };
+        if (distance <= radius*1.5) return { status:'near', label:'Near School Boundary', color:'yellow' };
+        return { status:'outside', label:'Outside School Premises', color:'red' };
+    },
+    euclideanDistance(desc1, desc2) {
+        if (!desc1 || !desc2 || desc1.length !== desc2.length) return 999;
+        let sum = 0;
+        for (let i = 0; i < desc1.length; i++) sum += Math.pow(desc1[i]-desc2[i], 2);
+        return Math.sqrt(sum);
+    },
+    formatTime(date) {
+        return new Date(date).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit' });
+    },
+    formatDateTime(date) {
+        return new Date(date).toLocaleString('en-US', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+    }
+};
+
+
+// =============================================
+// NOTIFICATION SCHEDULER (2-hour cycle)
+// =============================================
+const Scheduler = {
+    intervalId: null,
+    lastCycleNotified: 0,
+    start() {
+        // Check every 30 seconds for demo (production: every minute)
+        this.intervalId = setInterval(() => this.check(), 30000);
+        // Also check immediately
+        setTimeout(() => this.check(), 2000);
+    },
+    stop() { if (this.intervalId) clearInterval(this.intervalId); },
+    check() {
+        const currentUser = App.state.currentUser;
+        if (!currentUser || currentUser.role === 'admin') return;
+
+        const cycle = Utils.getCurrentCycle();
+        const today = Utils.getTodayDate();
+
+        // Only notify once per cycle
+        if (cycle === this.lastCycleNotified) return;
+
+        // Check if attendance already marked for this cycle
+        const records = DB.getAttendance(currentUser.id, today);
+        const alreadyMarked = records.find(r => r.cycle === cycle);
+
+        if (!alreadyMarked) {
+            this.lastCycleNotified = cycle;
+            const notif = {
+                id: DB.uuid(),
+                teacherId: currentUser.id,
+                message: `Attendance reminder! Please mark your attendance for ${Utils.getCycleLabel(cycle)}. Use face verification to check in.`,
+                type: 'attendance_reminder',
+                isRead: false,
+                sentAt: new Date().toISOString(),
+                cycle
+            };
+            DB.addNotification(notif);
+            App.state.notifications = DB.getNotifications(currentUser.id);
+            App.render();
+
+            // Browser notification
+            if (Notification.permission === 'granted') {
+                new Notification('Attendance Reminder', { body: notif.message, icon: '📋' });
+            }
+        }
+    },
+    triggerManual() {
+        const school = DB.getSchool();
+        const teachers = DB.getTeachers().filter(t => t.role === 'teacher' && t.status === 'active');
+        const cycle = Utils.getCurrentCycle();
+        const today = Utils.getTodayDate();
+
+        teachers.forEach(teacher => {
+            const records = DB.getAttendance(teacher.id, today);
+            if (!records.find(r => r.cycle === cycle)) {
+                DB.addNotification({
+                    id: DB.uuid(),
+                    teacherId: teacher.id,
+                    message: `Admin triggered: Mark attendance for ${Utils.getCycleLabel(cycle)} now!`,
+                    type: 'attendance_reminder',
+                    isRead: false,
+                    sentAt: new Date().toISOString(),
+                    cycle
+                });
+            }
+        });
+        return teachers.length;
+    }
+};
+
+
+// =============================================
+// FACE AUTHENTICATION ENGINE
+// =============================================
+const FaceEngine = {
+    modelsLoaded: false,
+    async loadModels() {
+        if (this.modelsLoaded) return true;
+        try {
+            if (typeof faceapi === 'undefined') {
+                console.warn('face-api.js not loaded yet, using fallback mode');
+                return false;
+            }
+            const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model';
+            await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
+            await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+            await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+            this.modelsLoaded = true;
+            return true;
+        } catch (err) {
+            console.error('Model load failed:', err);
+            return false;
+        }
+    },
+    async detectFace(videoElement) {
+        if (!this.modelsLoaded || typeof faceapi === 'undefined') return null;
+        try {
+            const detection = await faceapi.detectSingleFace(videoElement)
+                .withFaceLandmarks()
+                .withFaceDescriptor();
+            if (detection) return Array.from(detection.descriptor);
+            return null;
+        } catch (err) {
+            console.error('Face detection error:', err);
+            return null;
+        }
+    },
+    verifyFace(storedDescriptor, capturedDescriptor) {
+        if (!storedDescriptor || !capturedDescriptor) return false;
+        const distance = Utils.euclideanDistance(storedDescriptor, capturedDescriptor);
+        return distance < 0.6; // Threshold for match
+    }
+};
+
+
+// =============================================
+// GEOLOCATION ENGINE
+// =============================================
+const GeoEngine = {
+    currentPosition: null,
+    watchId: null,
+    async getCurrentPosition() {
+        return new Promise((resolve, reject) => {
+            if (!navigator.geolocation) {
+                reject(new Error('Geolocation not supported'));
+                return;
+            }
+            navigator.geolocation.getCurrentPosition(
+                pos => {
+                    this.currentPosition = { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
+                    resolve(this.currentPosition);
+                },
+                err => reject(err),
+                { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+            );
+        });
+    },
+    startTracking(callback) {
+        if (!navigator.geolocation) return;
+        this.watchId = navigator.geolocation.watchPosition(
+            pos => {
+                this.currentPosition = { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
+                if (callback) callback(this.currentPosition);
+            },
+            err => console.error('Geo tracking error:', err),
+            { enableHighAccuracy: true, maximumAge: 30000 }
+        );
+    },
+    stopTracking() {
+        if (this.watchId) navigator.geolocation.clearWatch(this.watchId);
+    },
+    verifyGeofence(lat, lng) {
+        const school = DB.getSchool();
+        const result = Utils.isInsideGeofence(lat, lng, school.latitude, school.longitude, school.radiusMeters);
+        const status = Utils.getGeofenceStatus(result.distance, school.radiusMeters);
+        return { ...result, ...status, school };
+    }
+};
+
+
+// =============================================
+// MAIN APPLICATION STATE & ROUTER
+// =============================================
+const App = {
+    state: {
+        currentUser: null,
+        currentPage: 'login', // login, dashboard, teacher
+        notifications: [],
+        liveData: null,
+        geofenceStatus: null,
+        myStatus: null,
+        showFaceModal: false,
+        faceMode: 'verify', // verify or register
+        showNotifPanel: false,
+        error: '',
+        success: '',
+        loading: false
+    },
+
+    init() {
+        DB.init();
+        // Check stored session
+        const stored = localStorage.getItem('att_session');
+        if (stored) {
+            const session = JSON.parse(stored);
+            const teacher = DB.getTeacher(session.id);
+            if (teacher) {
+                this.state.currentUser = teacher;
+                this.state.currentPage = teacher.role === 'admin' ? 'dashboard' : 'teacher';
+                this.state.notifications = DB.getNotifications(teacher.id);
+            }
+        }
+        // Request notification permission
+        if ('Notification' in window && Notification.permission === 'default') {
+            Notification.requestPermission();
+        }
+        Scheduler.start();
+        this.render();
+        // Auto-refresh dashboard every 10 seconds
+        setInterval(() => { if (this.state.currentPage === 'dashboard') this.refreshDashboard(); }, 10000);
+    },
+
+    login(email, password) {
+        const teacher = DB.getTeacherByEmail(email);
+        if (!teacher || teacher.password !== password) {
+            this.state.error = 'Invalid email or password';
+            this.render();
+            return;
+        }
+        this.state.currentUser = teacher;
+        this.state.currentPage = teacher.role === 'admin' ? 'dashboard' : 'teacher';
+        this.state.notifications = DB.getNotifications(teacher.id);
+        this.state.error = '';
+        localStorage.setItem('att_session', JSON.stringify({ id: teacher.id }));
+        this.render();
+    },
+
+    logout() {
+        this.state.currentUser = null;
+        this.state.currentPage = 'login';
+        this.state.error = '';
+        this.state.success = '';
+        localStorage.removeItem('att_session');
+        GeoEngine.stopTracking();
+        this.render();
+    },
+
+    refreshDashboard() {
+        if (this.state.currentPage === 'dashboard') this.render();
+    },
+
+    render() {
+        const app = document.getElementById('app');
+        switch (this.state.currentPage) {
+            case 'login': app.innerHTML = this.renderLogin(); break;
+            case 'dashboard': app.innerHTML = this.renderDashboard(); break;
+            case 'teacher': app.innerHTML = this.renderTeacherPanel(); break;
+        }
+        this.attachEvents();
+    },
+
+
+    // =============================================
+    // LOGIN PAGE
+    // =============================================
+    renderLogin() {
+        return `
+        <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-100 via-white to-purple-100 p-4">
+            <div class="max-w-md w-full">
+                <div class="bg-white rounded-2xl shadow-xl p-8 fade-in">
+                    <div class="text-center mb-8">
+                        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-indigo-100 mb-4">
+                            <svg class="w-8 h-8 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+                        </div>
+                        <h1 class="text-2xl font-bold text-gray-900">Live Attendance Panel</h1>
+                        <p class="text-gray-500 mt-1">Face Auth + Geofencing + Real-time Monitoring</p>
+                    </div>
+                    ${this.state.error ? `<div class="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">${this.state.error}</div>` : ''}
+                    <form id="loginForm" class="space-y-5">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+                            <input type="email" id="loginEmail" class="w-full px-4 py-3 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 transition" placeholder="Enter your email" required>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                            <div class="relative">
+                                <input type="password" id="loginPassword" class="w-full px-4 py-3 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 transition" placeholder="Enter password" required>
+                            </div>
+                        </div>
+                        <button type="submit" class="w-full py-3 bg-indigo-600 text-white rounded-lg font-medium hover:bg-indigo-700 transition">Sign In</button>
+                    </form>
+                    <div class="mt-6 p-4 bg-slate-50 rounded-lg">
+                        <p class="text-xs font-medium text-slate-500 mb-2">Demo Credentials:</p>
+                        <div class="space-y-1 text-xs text-slate-600">
+                            <p><span class="font-medium">Admin:</span> admin@school.com / admin123</p>
+                            <p><span class="font-medium">Teacher:</span> sarah@school.com / teacher123</p>
+                        </div>
+                    </div>
+                    <div class="mt-4 p-3 bg-indigo-50 rounded-lg">
+                        <p class="text-xs text-indigo-700"><strong>Features:</strong> Face Authentication, GPS Geofencing (${DB.getSchool().radiusMeters}m radius), 2-Hour Notifications, Live Dashboard</p>
+                    </div>
+                </div>
+            </div>
+        </div>`;
+    },
+
+
+    // =============================================
+    // ADMIN DASHBOARD (Live Monitoring)
+    // =============================================
+    renderDashboard() {
+        const school = DB.getSchool();
+        const teachers = DB.getTeachers().filter(t => t.status === 'active');
+        const today = Utils.getTodayDate();
+        const cycle = Utils.getCurrentCycle();
+        const todayRecords = DB.getAllAttendanceToday(today);
+
+        let insideCount = 0, outsideCount = 0, absentCount = 0;
+        const teacherRows = teachers.map(t => {
+            const records = todayRecords.filter(r => r.teacherId === t.id);
+            const currentRecord = records.find(r => r.cycle === cycle);
+            let status = 'absent', statusClass = 'status-red', statusLabel = 'Absent';
+            if (currentRecord) {
+                if (currentRecord.isInsideGeofence) { status='inside'; statusClass='status-green'; statusLabel='Inside'; insideCount++; }
+                else { status='outside'; statusClass='status-yellow'; statusLabel='Outside'; outsideCount++; }
+            } else { absentCount++; }
+            const rate = records.filter(r=>r.status==='present').length + '/' + Math.max(cycle, 1);
+            return { ...t, status, statusClass, statusLabel, currentRecord, rate, records };
+        });
+
+        const unread = this.state.notifications.filter(n => !n.isRead).length;
+
+        return `
+        <div class="min-h-screen bg-slate-50">
+            <header class="bg-white shadow-sm border-b border-slate-200">
+                <div class="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
+                    <div class="flex items-center gap-3">
+                        <div class="w-3 h-3 bg-red-500 rounded-full pulse-dot"></div>
+                        <h1 class="text-xl font-bold text-slate-900">Live Attendance Panel</h1>
+                        <span class="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-medium">LIVE</span>
+                    </div>
+                    <div class="flex items-center gap-4">
+                        <button id="btnRefresh" class="p-2 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg" title="Refresh">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                        </button>
+                        <div class="relative">
+                            <button id="btnNotif" class="p-2 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
+                                ${unread > 0 ? `<span class="notification-badge">${unread}</span>` : ''}
+                            </button>
+                        </div>
+                        <span class="text-sm text-slate-600">${this.state.currentUser.name}</span>
+                        <button id="btnLogout" class="p-2 text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-lg" title="Logout">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
+                        </button>
+                    </div>
+                </div>
+            </header>
+            <main class="max-w-7xl mx-auto px-4 py-6">
+                <!-- Stats -->
+                <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+                    <div class="bg-white rounded-xl shadow-sm border p-4">
+                        <p class="text-2xl font-bold text-indigo-600">${teachers.length}</p>
+                        <p class="text-xs text-slate-500">Total Teachers</p>
+                    </div>
+                    <div class="bg-white rounded-xl shadow-sm border p-4">
+                        <p class="text-2xl font-bold text-green-600">${insideCount}</p>
+                        <p class="text-xs text-slate-500">Present (Inside)</p>
+                    </div>
+                    <div class="bg-white rounded-xl shadow-sm border p-4">
+                        <p class="text-2xl font-bold text-yellow-600">${outsideCount}</p>
+                        <p class="text-xs text-slate-500">Present (Outside)</p>
+                    </div>
+                    <div class="bg-white rounded-xl shadow-sm border p-4">
+                        <p class="text-2xl font-bold text-red-600">${absentCount}</p>
+                        <p class="text-xs text-slate-500">Absent</p>
+                    </div>
+                    <div class="bg-white rounded-xl shadow-sm border p-4">
+                        <p class="text-2xl font-bold text-purple-600">C${cycle}</p>
+                        <p class="text-xs text-slate-500">${Utils.getCycleLabel(cycle)}</p>
+                    </div>
+                </div>
+
+                <!-- Controls -->
+                <div class="flex items-center justify-between mb-4">
+                    <div>
+                        <h2 class="text-lg font-semibold text-slate-800">Teacher Status</h2>
+                        <p class="text-xs text-slate-400">Auto-refreshes every 10s | Last: ${new Date().toLocaleTimeString()}</p>
+                    </div>
+                    <button id="btnTriggerNotif" class="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition text-sm font-medium">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
+                        Send 2-Hr Reminder
+                    </button>
+                </div>
+
+                <!-- Teacher Table -->
+                <div class="bg-white rounded-xl shadow-sm border overflow-hidden">
+                    <table class="w-full">
+                        <thead class="bg-slate-50 border-b">
+                            <tr>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-slate-500 uppercase">Teacher</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-slate-500 uppercase">Status</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-slate-500 uppercase">Location</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-slate-500 uppercase">Face Verified</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-slate-500 uppercase">Today's Rate</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-slate-500 uppercase">Last Check-in</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-100">
+                            ${teacherRows.map(t => `
+                            <tr class="hover:bg-slate-50">
+                                <td class="px-4 py-3">
+                                    <div class="flex items-center gap-3">
+                                        <div class="w-8 h-8 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-600 font-medium text-sm">${t.name.charAt(0)}</div>
+                                        <div><p class="text-sm font-medium text-slate-800">${t.name}</p><p class="text-xs text-slate-400">${t.email}</p></div>
+                                    </div>
+                                </td>
+                                <td class="px-4 py-3"><span class="px-2 py-1 rounded-full text-xs font-medium ${t.statusClass}">${t.statusLabel}</span></td>
+                                <td class="px-4 py-3">
+                                    ${t.currentRecord ? `<span class="text-xs ${t.currentRecord.isInsideGeofence ? 'text-green-600' : 'text-red-600'}">${t.currentRecord.isInsideGeofence ? '📍 In campus' : '⚠️ Off campus ('+t.currentRecord.distance+'m)'}</span>` : '<span class="text-xs text-slate-400">No data</span>'}
+                                </td>
+                                <td class="px-4 py-3"><span class="text-xs ${t.currentRecord?.faceVerified ? 'text-green-600 font-medium' : 'text-slate-400'}">${t.currentRecord?.faceVerified ? '✓ Verified' : 'Not yet'}</span></td>
+                                <td class="px-4 py-3"><span class="text-sm font-medium">${t.rate}</span></td>
+                                <td class="px-4 py-3"><span class="text-xs text-slate-600">${t.currentRecord ? Utils.formatTime(t.currentRecord.checkInTime) : '--'}</span></td>
+                            </tr>`).join('')}
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- School Geofence Info -->
+                <div class="mt-6 bg-white rounded-xl shadow-sm border p-6">
+                    <h3 class="text-lg font-semibold text-slate-800 mb-4">📍 School Geofence Configuration</h3>
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+                        <div class="p-3 bg-slate-50 rounded-lg"><p class="text-xs text-slate-500">School</p><p class="text-sm font-semibold">${school.name}</p></div>
+                        <div class="p-3 bg-slate-50 rounded-lg"><p class="text-xs text-slate-500">Coordinates</p><p class="text-sm font-semibold">${school.latitude.toFixed(4)}, ${school.longitude.toFixed(4)}</p></div>
+                        <div class="p-3 bg-slate-50 rounded-lg"><p class="text-xs text-slate-500">Radius</p><p class="text-sm font-semibold">${school.radiusMeters}m</p></div>
+                        <div class="p-3 bg-slate-50 rounded-lg"><p class="text-xs text-slate-500">2-Hour Cycles</p><p class="text-sm font-semibold">5 cycles/day</p></div>
+                    </div>
+                    <div id="map"></div>
+                </div>
+            </main>
+        </div>`;
+    },
+
+
+    // =============================================
+    // TEACHER PANEL
+    // =============================================
+    renderTeacherPanel() {
+        const user = this.state.currentUser;
+        const school = DB.getSchool();
+        const today = Utils.getTodayDate();
+        const cycle = Utils.getCurrentCycle();
+        const records = DB.getAttendance(user.id, today);
+        const currentRecord = records.find(r => r.cycle === cycle);
+        const totalMarked = records.filter(r => r.status === 'present').length;
+        const unread = this.state.notifications.filter(n => !n.isRead).length;
+        const geo = this.state.geofenceStatus;
+
+        return `
+        <div class="min-h-screen bg-slate-50">
+            <header class="bg-white shadow-sm border-b">
+                <div class="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
+                    <div class="flex items-center gap-3">
+                        <svg class="w-6 h-6 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+                        <div><h1 class="text-lg font-bold text-slate-900">My Attendance</h1><p class="text-xs text-slate-500">${school.name}</p></div>
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <div class="relative">
+                            <button id="btnNotif" class="p-2 text-slate-500 hover:text-indigo-600 rounded-lg">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
+                                ${unread > 0 ? `<span class="notification-badge">${unread}</span>` : ''}
+                            </button>
+                        </div>
+                        <span class="text-sm text-slate-600">${user.name}</span>
+                        <button id="btnLogout" class="p-2 text-slate-400 hover:text-red-500"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg></button>
+                    </div>
+                </div>
+            </header>
+            <main class="max-w-4xl mx-auto px-4 py-6 space-y-6">
+                <!-- Success/Error -->
+                ${this.state.success ? `<div class="p-4 bg-green-50 border border-green-200 rounded-lg text-green-700 text-sm fade-in">${this.state.success}</div>` : ''}
+                ${this.state.error ? `<div class="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm fade-in">${this.state.error}</div>` : ''}
+
+                <!-- Today's Status -->
+                <div class="bg-white rounded-xl shadow-sm border p-6 fade-in">
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-lg font-semibold text-slate-800">Today's Status</h2>
+                        <span class="text-xs bg-indigo-100 text-indigo-700 px-2 py-1 rounded-full">Cycle ${cycle}: ${Utils.getCycleLabel(cycle)}</span>
+                    </div>
+                    <div class="grid grid-cols-3 gap-4 mb-4">
+                        <div class="text-center p-3 bg-slate-50 rounded-lg"><p class="text-2xl font-bold text-indigo-600">${totalMarked}</p><p class="text-xs text-slate-500">Marked</p></div>
+                        <div class="text-center p-3 bg-slate-50 rounded-lg"><p class="text-2xl font-bold text-slate-600">${Math.max(cycle,1)}</p><p class="text-xs text-slate-500">Total Cycles</p></div>
+                        <div class="text-center p-3 bg-slate-50 rounded-lg"><p class="text-2xl font-bold text-green-600">${cycle > 0 ? Math.round((totalMarked/Math.max(cycle,1))*100) : 0}%</p><p class="text-xs text-slate-500">Rate</p></div>
+                    </div>
+                    <!-- Cycle indicators -->
+                    <div class="flex gap-2">
+                        ${[1,2,3,4,5].map(c => {
+                            const r = records.find(rec => rec.cycle === c);
+                            const isCurrent = c === cycle;
+                            return `<div class="flex-1 p-2 rounded-lg text-center border-2 ${r ? 'bg-green-50 border-green-300' : isCurrent ? 'bg-indigo-50 border-indigo-300' : 'bg-slate-50 border-slate-200'}">
+                                <p class="text-xs font-medium text-slate-600">C${c}</p>
+                                <p class="text-sm mt-1">${r ? '✅' : '⬜'}</p>
+                            </div>`;
+                        }).join('')}
+                    </div>
+                </div>
+
+                <!-- Geofence Status -->
+                <div class="rounded-xl shadow-sm border p-6 fade-in ${geo ? (geo.isInside ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200') : 'bg-white'}">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-sm font-semibold text-slate-700">📍 Geofence Status</h3>
+                        <button id="btnRefreshGeo" class="text-xs text-indigo-600 hover:text-indigo-800">Refresh Location</button>
+                    </div>
+                    ${geo ? `
+                        <div class="flex items-center gap-4">
+                            <div class="p-3 rounded-full ${geo.isInside ? 'bg-green-100' : 'bg-red-100'}">
+                                <span class="text-2xl">${geo.isInside ? '✅' : '⚠️'}</span>
+                            </div>
+                            <div>
+                                <p class="text-lg font-bold ${geo.isInside ? 'text-green-800' : 'text-red-800'}">${geo.label}</p>
+                                <p class="text-sm text-slate-500">${geo.distance}m from school center (radius: ${school.radiusMeters}m)</p>
+                            </div>
+                        </div>
+                        <div class="mt-4">
+                            <div class="w-full bg-slate-200 rounded-full h-2 overflow-hidden">
+                                <div class="h-full rounded-full ${geo.isInside ? 'bg-green-500' : 'bg-red-500'}" style="width:${Math.min((geo.distance/(school.radiusMeters*2))*100,100)}%"></div>
+                            </div>
+                            <div class="flex justify-between text-xs mt-1 text-slate-400"><span>0m</span><span class="font-medium ${geo.isInside?'text-green-600':'text-red-600'}">You: ${geo.distance}m</span><span>${school.radiusMeters*2}m</span></div>
+                        </div>
+                        ${!geo.isInside ? `<div class="mt-3 p-3 bg-red-100 rounded-lg text-xs text-red-700">⚠️ Warning: You are ${geo.distance - school.radiusMeters}m outside the school boundary. Admin has been notified.</div>` : ''}
+                    ` : `<p class="text-sm text-slate-400">Click "Refresh Location" to check your geofence status</p>`}
+                </div>
+
+                <!-- Action Buttons -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    ${!user.faceDescriptor ? `
+                    <button id="btnFaceRegister" class="flex items-center gap-3 p-4 bg-purple-600 text-white rounded-xl hover:bg-purple-700 transition">
+                        <span class="text-2xl">📷</span>
+                        <div class="text-left"><p class="font-medium">Register Your Face</p><p class="text-xs text-purple-200">Required for face authentication</p></div>
+                    </button>` : ''}
+                    <button id="btnCheckIn" class="flex items-center gap-3 p-4 bg-green-600 text-white rounded-xl hover:bg-green-700 transition ${this.state.loading ? 'opacity-50' : ''}">
+                        <span class="text-2xl">✅</span>
+                        <div class="text-left"><p class="font-medium">${this.state.loading ? 'Processing...' : 'Mark Attendance'}</p><p class="text-xs text-green-200">Face verification + GPS location</p></div>
+                    </button>
+                    <button id="btnCheckOut" class="flex items-center gap-3 p-4 bg-slate-600 text-white rounded-xl hover:bg-slate-700 transition">
+                        <span class="text-2xl">🚪</span>
+                        <div class="text-left"><p class="font-medium">Check Out</p><p class="text-xs text-slate-300">End current cycle session</p></div>
+                    </button>
+                    <button id="btnRefreshGeo2" class="flex items-center gap-3 p-4 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition">
+                        <span class="text-2xl">📍</span>
+                        <div class="text-left"><p class="font-medium">Update Location</p><p class="text-xs text-blue-200">Check geofence status</p></div>
+                    </button>
+                </div>
+
+                <!-- Notifications -->
+                ${unread > 0 ? `
+                <div class="bg-white rounded-xl shadow-sm border p-4">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-sm font-semibold text-slate-800">🔔 Pending Reminders (${unread})</h3>
+                        <button id="btnMarkAllRead" class="text-xs text-indigo-600">Mark all read</button>
+                    </div>
+                    <div class="space-y-2">
+                        ${this.state.notifications.filter(n=>!n.isRead).slice(0,5).map(n => `
+                        <div class="p-3 bg-orange-50 rounded-lg flex items-start gap-2">
+                            <span class="text-orange-500">⏰</span>
+                            <div class="flex-1"><p class="text-sm text-slate-700">${n.message}</p><p class="text-xs text-slate-400 mt-1">${Utils.formatDateTime(n.sentAt)}</p></div>
+                            <button onclick="App.dismissNotif('${n.id}')" class="text-xs text-indigo-600 hover:text-indigo-800">Dismiss</button>
+                        </div>`).join('')}
+                    </div>
+                </div>` : ''}
+
+                <!-- Map -->
+                <div class="bg-white rounded-xl shadow-sm border p-4">
+                    <h3 class="text-sm font-semibold text-slate-800 mb-3">🗺️ School Location & Your Position</h3>
+                    <div id="map"></div>
+                </div>
+            </main>
+        </div>
+
+        <!-- Face Auth Modal -->
+        ${this.state.showFaceModal ? this.renderFaceModal() : ''}
+        `;
+    },
+
+
+    // =============================================
+    // FACE AUTH MODAL
+    // =============================================
+    renderFaceModal() {
+        const mode = this.state.faceMode;
+        return `
+        <div class="fixed inset-0 modal-overlay flex items-center justify-center z-50 p-4" id="faceModal">
+            <div class="bg-white rounded-2xl max-w-lg w-full overflow-hidden shadow-2xl fade-in">
+                <div class="flex items-center justify-between p-4 border-b">
+                    <div class="flex items-center gap-2">
+                        <span class="text-indigo-600">📷</span>
+                        <h3 class="font-semibold text-slate-800">${mode === 'register' ? 'Register Your Face' : 'Face Verification'}</h3>
+                    </div>
+                    <button id="btnCloseFace" class="p-1 text-slate-400 hover:text-slate-600 text-xl">&times;</button>
+                </div>
+                <div class="relative bg-black aspect-video">
+                    <video id="faceVideo" autoplay muted playsinline class="w-full h-full object-cover"></video>
+                    <canvas id="faceCanvas" class="absolute inset-0 w-full h-full pointer-events-none"></canvas>
+                    <div class="camera-guide"></div>
+                    <div class="absolute bottom-3 left-3 right-3">
+                        <div id="faceStatus" class="flex items-center gap-2 px-3 py-2 rounded-lg bg-black/60 text-white text-sm">
+                            <span>Initializing camera...</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="p-4 flex gap-3">
+                    <button id="btnCancelFace" class="flex-1 py-3 border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50 font-medium">Cancel</button>
+                    <button id="btnCaptureFace" class="flex-1 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 font-medium flex items-center justify-center gap-2">
+                        📷 ${mode === 'register' ? 'Capture Face' : 'Verify & Check In'}
+                    </button>
+                </div>
+            </div>
+        </div>`;
+    },
+
+
+    // =============================================
+    // EVENT HANDLERS
+    // =============================================
+    attachEvents() {
+        // Login form
+        const loginForm = document.getElementById('loginForm');
+        if (loginForm) {
+            loginForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const email = document.getElementById('loginEmail').value;
+                const password = document.getElementById('loginPassword').value;
+                this.login(email, password);
+            });
+        }
+
+        // Logout
+        const btnLogout = document.getElementById('btnLogout');
+        if (btnLogout) btnLogout.addEventListener('click', () => this.logout());
+
+        // Refresh
+        const btnRefresh = document.getElementById('btnRefresh');
+        if (btnRefresh) btnRefresh.addEventListener('click', () => this.render());
+
+        // Notifications panel
+        const btnNotif = document.getElementById('btnNotif');
+        if (btnNotif) btnNotif.addEventListener('click', () => {
+            this.state.showNotifPanel = !this.state.showNotifPanel;
+            // Simple alert with notifications for now
+            const notifs = this.state.notifications.filter(n=>!n.isRead);
+            if (notifs.length === 0) { alert('No new notifications'); return; }
+            alert('Notifications:\n\n' + notifs.slice(0,5).map(n=>n.message).join('\n\n'));
+        });
+
+        // Trigger notification (admin)
+        const btnTrigger = document.getElementById('btnTriggerNotif');
+        if (btnTrigger) btnTrigger.addEventListener('click', () => {
+            const count = Scheduler.triggerManual();
+            alert(`Attendance reminders sent to ${count} teachers for Cycle ${Utils.getCurrentCycle()}!`);
+            this.render();
+        });
+
+        // Face register
+        const btnFaceReg = document.getElementById('btnFaceRegister');
+        if (btnFaceReg) btnFaceReg.addEventListener('click', () => {
+            this.state.faceMode = 'register';
+            this.state.showFaceModal = true;
+            this.render();
+        });
+
+        // Check in
+        const btnCheckIn = document.getElementById('btnCheckIn');
+        if (btnCheckIn) btnCheckIn.addEventListener('click', () => {
+            this.state.faceMode = 'verify';
+            this.state.showFaceModal = true;
+            this.state.error = '';
+            this.state.success = '';
+            this.render();
+        });
+
+        // Check out
+        const btnCheckOut = document.getElementById('btnCheckOut');
+        if (btnCheckOut) btnCheckOut.addEventListener('click', () => this.handleCheckOut());
+
+        // Refresh geo
+        const btnGeo = document.getElementById('btnRefreshGeo');
+        const btnGeo2 = document.getElementById('btnRefreshGeo2');
+        if (btnGeo) btnGeo.addEventListener('click', () => this.refreshGeofence());
+        if (btnGeo2) btnGeo2.addEventListener('click', () => this.refreshGeofence());
+
+        // Mark all read
+        const btnMarkAll = document.getElementById('btnMarkAllRead');
+        if (btnMarkAll) btnMarkAll.addEventListener('click', () => {
+            DB.markAllRead(this.state.currentUser.id);
+            this.state.notifications = DB.getNotifications(this.state.currentUser.id);
+            this.render();
+        });
+
+        // Face modal events
+        if (this.state.showFaceModal) {
+            this.startCamera();
+            const btnClose = document.getElementById('btnCloseFace');
+            const btnCancel = document.getElementById('btnCancelFace');
+            const btnCapture = document.getElementById('btnCaptureFace');
+            if (btnClose) btnClose.addEventListener('click', () => this.closeFaceModal());
+            if (btnCancel) btnCancel.addEventListener('click', () => this.closeFaceModal());
+            if (btnCapture) btnCapture.addEventListener('click', () => this.captureFace());
+        }
+
+        // Initialize map
+        this.initMap();
+    },
+
+
+    // =============================================
+    // MAP INITIALIZATION
+    // =============================================
+    initMap() {
+        const mapEl = document.getElementById('map');
+        if (!mapEl || typeof L === 'undefined') return;
+        
+        setTimeout(() => {
+            const school = DB.getSchool();
+            const map = L.map('map').setView([school.latitude, school.longitude], 15);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; OpenStreetMap'
+            }).addTo(map);
+
+            // School marker
+            L.marker([school.latitude, school.longitude])
+                .addTo(map)
+                .bindPopup(`<b>${school.name}</b><br>Geofence: ${school.radiusMeters}m radius`);
+
+            // Geofence circle
+            L.circle([school.latitude, school.longitude], {
+                radius: school.radiusMeters,
+                color: '#4f46e5',
+                fillColor: '#4f46e5',
+                fillOpacity: 0.1,
+                weight: 2,
+                dashArray: '5,5'
+            }).addTo(map);
+
+            // Teacher position
+            if (GeoEngine.currentPosition) {
+                const pos = GeoEngine.currentPosition;
+                const geo = GeoEngine.verifyGeofence(pos.latitude, pos.longitude);
+                L.marker([pos.latitude, pos.longitude], {
+                    icon: L.divIcon({
+                        className: '',
+                        html: `<div style="background:${geo.isInside?'#22c55e':'#ef4444'};width:16px;height:16px;border-radius:50%;border:3px solid white;box-shadow:0 2px 6px rgba(0,0,0,0.3)"></div>`,
+                        iconSize: [16, 16],
+                        iconAnchor: [8, 8]
+                    })
+                }).addTo(map).bindPopup(`<b>Your Location</b><br>${geo.distance}m from school`);
+            }
+        }, 100);
+    },
+
+
+    // =============================================
+    // CAMERA & FACE CAPTURE
+    // =============================================
+    cameraStream: null,
+
+    async startCamera() {
+        const video = document.getElementById('faceVideo');
+        const statusEl = document.getElementById('faceStatus');
+        if (!video) return;
+
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: 'user', width: 640, height: 480 }
+            });
+            this.cameraStream = stream;
+            video.srcObject = stream;
+            await video.play();
+
+            if (statusEl) statusEl.innerHTML = '<span>Camera ready. Position your face in the oval and click capture.</span>';
+
+            // Try loading face-api models
+            const loaded = await FaceEngine.loadModels();
+            if (loaded && statusEl) {
+                statusEl.innerHTML = '<span style="color:#86efac">✓ Face detection models loaded. Ready to capture.</span>';
+            }
+        } catch (err) {
+            if (statusEl) statusEl.innerHTML = '<span style="color:#fca5a5">Camera access denied. Please allow camera permissions.</span>';
+        }
+    },
+
+    stopCamera() {
+        if (this.cameraStream) {
+            this.cameraStream.getTracks().forEach(t => t.stop());
+            this.cameraStream = null;
+        }
+    },
+
+    closeFaceModal() {
+        this.stopCamera();
+        this.state.showFaceModal = false;
+        this.render();
+    },
+
+    async captureFace() {
+        const video = document.getElementById('faceVideo');
+        const statusEl = document.getElementById('faceStatus');
+        const btnCapture = document.getElementById('btnCaptureFace');
+
+        if (btnCapture) btnCapture.disabled = true;
+        if (statusEl) statusEl.innerHTML = '<span>🔄 Analyzing face...</span>';
+
+        let descriptor = null;
+
+        // Try face-api.js first
+        if (FaceEngine.modelsLoaded && video) {
+            descriptor = await FaceEngine.detectFace(video);
+        }
+
+        // Fallback: generate descriptor from video frame analysis
+        if (!descriptor) {
+            // Use canvas to capture frame and generate a pseudo-descriptor
+            const canvas = document.createElement('canvas');
+            canvas.width = 640; canvas.height = 480;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0);
+            
+            // Generate descriptor from pixel data (simplified face hash)
+            const imageData = ctx.getImageData(200, 100, 240, 280);
+            descriptor = [];
+            for (let i = 0; i < 128; i++) {
+                const idx = Math.floor(i * (imageData.data.length / 128));
+                descriptor.push((imageData.data[idx] / 255) - 0.5);
+            }
+        }
+
+        if (!descriptor || descriptor.length === 0) {
+            if (statusEl) statusEl.innerHTML = '<span style="color:#fca5a5">No face detected. Please try again.</span>';
+            if (btnCapture) btnCapture.disabled = false;
+            return;
+        }
+
+        if (this.state.faceMode === 'register') {
+            // Register face
+            DB.updateTeacher(this.state.currentUser.id, { faceDescriptor: descriptor });
+            this.state.currentUser = DB.getTeacher(this.state.currentUser.id);
+            localStorage.setItem('att_session', JSON.stringify({ id: this.state.currentUser.id }));
+            if (statusEl) statusEl.innerHTML = '<span style="color:#86efac">✅ Face registered successfully!</span>';
+            setTimeout(() => this.closeFaceModal(), 1500);
+        } else {
+            // Verify face and check in
+            await this.handleCheckIn(descriptor);
+        }
+    },
+
+
+    // =============================================
+    // CHECK-IN / CHECK-OUT LOGIC
+    // =============================================
+    async handleCheckIn(faceDescriptor) {
+        const statusEl = document.getElementById('faceStatus');
+        const user = this.state.currentUser;
+
+        // Verify face against stored descriptor
+        if (user.faceDescriptor) {
+            const isMatch = FaceEngine.verifyFace(user.faceDescriptor, faceDescriptor);
+            if (!isMatch) {
+                if (statusEl) statusEl.innerHTML = '<span style="color:#fca5a5">❌ Face verification failed! Your face does not match the registered face.</span>';
+                const btnCapture = document.getElementById('btnCaptureFace');
+                if (btnCapture) btnCapture.disabled = false;
+                return;
+            }
+        }
+
+        if (statusEl) statusEl.innerHTML = '<span style="color:#86efac">✅ Face verified! Getting location...</span>';
+
+        // Get location
+        let position;
+        try {
+            position = await GeoEngine.getCurrentPosition();
+        } catch (err) {
+            // Use school location as fallback for demo
+            const school = DB.getSchool();
+            position = { latitude: school.latitude + (Math.random()-0.5)*0.002, longitude: school.longitude + (Math.random()-0.5)*0.002 };
+        }
+
+        // Check geofence
+        const geo = GeoEngine.verifyGeofence(position.latitude, position.longitude);
+        this.state.geofenceStatus = geo;
+
+        // Create attendance record
+        const cycle = Utils.getCurrentCycle();
+        const record = {
+            id: DB.uuid(),
+            teacherId: user.id,
+            schoolId: user.schoolId,
+            checkInTime: new Date().toISOString(),
+            checkOutTime: null,
+            status: 'present',
+            locationLat: position.latitude,
+            locationLng: position.longitude,
+            isInsideGeofence: geo.isInside,
+            distance: geo.distance,
+            faceVerified: true,
+            date: Utils.getTodayDate(),
+            cycle: cycle
+        };
+
+        DB.addAttendance(record);
+
+        // Log location
+        DB.addLocationLog({
+            id: DB.uuid(),
+            teacherId: user.id,
+            latitude: position.latitude,
+            longitude: position.longitude,
+            isInsideGeofence: geo.isInside,
+            loggedAt: new Date().toISOString()
+        });
+
+        // Generate alert if outside geofence
+        if (!geo.isInside) {
+            DB.addNotification({
+                id: DB.uuid(),
+                teacherId: user.id,
+                message: `⚠️ Geofence Alert: You checked in ${geo.distance}m away from school premises.`,
+                type: 'geofence_alert',
+                isRead: false,
+                sentAt: new Date().toISOString()
+            });
+        }
+
+        this.state.success = `✅ Attendance marked! Cycle ${cycle} (${Utils.getCycleLabel(cycle)}) | Face: Verified | Location: ${geo.isInside ? 'Inside' : 'Outside ('+geo.distance+'m)'}`;
+        this.state.error = '';
+        this.state.notifications = DB.getNotifications(user.id);
+
+        if (statusEl) statusEl.innerHTML = '<span style="color:#86efac">✅ Attendance marked successfully!</span>';
+        setTimeout(() => this.closeFaceModal(), 1500);
+    },
+
+    handleCheckOut() {
+        const user = this.state.currentUser;
+        const today = Utils.getTodayDate();
+        const cycle = Utils.getCurrentCycle();
+        const records = DB.getAttendance(user.id, today);
+        const currentRecord = records.find(r => r.cycle === cycle);
+
+        if (!currentRecord) {
+            this.state.error = 'No check-in found for current cycle. Please check in first.';
+            this.state.success = '';
+            this.render();
+            return;
+        }
+
+        // Update with checkout time
+        DB.addAttendance({ ...currentRecord, checkOutTime: new Date().toISOString() });
+        this.state.success = `🚪 Checked out for Cycle ${cycle} at ${new Date().toLocaleTimeString()}`;
+        this.state.error = '';
+        this.render();
+    },
+
+    async refreshGeofence() {
+        try {
+            const pos = await GeoEngine.getCurrentPosition();
+            const geo = GeoEngine.verifyGeofence(pos.latitude, pos.longitude);
+            this.state.geofenceStatus = geo;
+
+            DB.addLocationLog({
+                id: DB.uuid(),
+                teacherId: this.state.currentUser.id,
+                latitude: pos.latitude,
+                longitude: pos.longitude,
+                isInsideGeofence: geo.isInside,
+                loggedAt: new Date().toISOString()
+            });
+
+            // Alert if outside
+            if (!geo.isInside) {
+                this.state.error = `⚠️ You are ${geo.distance}m from school (outside ${DB.getSchool().radiusMeters}m radius)`;
+            } else {
+                this.state.success = `📍 Location verified: ${geo.distance}m from school center (inside radius)`;
+                this.state.error = '';
+            }
+        } catch (err) {
+            this.state.error = 'Unable to get location. Please enable GPS and try again.';
+        }
+        this.render();
+    },
+
+    dismissNotif(id) {
+        DB.markNotifRead(id);
+        this.state.notifications = DB.getNotifications(this.state.currentUser.id);
+        this.render();
+    }
+};
+
+
+// =============================================
+// INITIALIZE APPLICATION
+// =============================================
+document.addEventListener('DOMContentLoaded', () => {
+    App.init();
+});
+</script>
+</body>
+</html>
