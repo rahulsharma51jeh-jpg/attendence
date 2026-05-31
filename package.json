@@ -1,0 +1,15 @@
+{
+  "name": "live-attendance-panel",
+  "version": "1.0.0",
+  "description": "Production-ready live attendance monitoring system with face authentication, geofencing, and real-time tracking",
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "server": "npm run dev --prefix server",
+    "client": "npm run dev --prefix client",
+    "build": "npm run build --prefix client",
+    "setup": "npm install --prefix server && npm install --prefix client && npm run db:push --prefix server && npm run db:seed --prefix server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}

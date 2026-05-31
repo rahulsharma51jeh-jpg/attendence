@@ -1,0 +1,86 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model School {
+  id            String   @id @default(uuid())
+  name          String
+  address       String
+  latitude      Float
+  longitude     Float
+  radiusMeters  Float    @default(200)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  teachers      Teacher[]
+  attendance    AttendanceRecord[]
+}
+
+model Teacher {
+  id              String   @id @default(uuid())
+  schoolId        String
+  name            String
+  email           String   @unique
+  passwordHash    String
+  faceDescriptor  String?  // JSON array of face descriptor
+  avatarUrl       String?
+  role            String   @default("teacher")
+  status          String   @default("active") // active, inactive
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  school          School   @relation(fields: [schoolId], references: [id])
+  attendance      AttendanceRecord[]
+  notifications   Notification[]
+  locationLogs    LocationLog[]
+}
+
+model AttendanceRecord {
+  id              String   @id @default(uuid())
+  teacherId       String
+  schoolId        String
+  checkInTime     DateTime?
+  checkOutTime    DateTime?
+  status          String   @default("absent") // present, absent, late, left_early
+  locationLat     Float?
+  locationLng     Float?
+  isInsideGeofence Boolean @default(false)
+  faceVerified    Boolean  @default(false)
+  date            String   // YYYY-MM-DD format for easy querying
+  cycle           Int      @default(1) // Which 2-hour cycle (1-5)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  teacher         Teacher  @relation(fields: [teacherId], references: [id])
+  school          School   @relation(fields: [schoolId], references: [id])
+
+  @@unique([teacherId, date, cycle])
+}
+
+model Notification {
+  id          String   @id @default(uuid())
+  teacherId   String
+  message     String
+  type        String   @default("attendance_reminder") // attendance_reminder, geofence_alert, system
+  isRead      Boolean  @default(false)
+  sentAt      DateTime @default(now())
+  scheduledFor DateTime?
+
+  teacher     Teacher  @relation(fields: [teacherId], references: [id])
+}
+
+model LocationLog {
+  id              String   @id @default(uuid())
+  teacherId       String
+  latitude        Float
+  longitude       Float
+  isInsideGeofence Boolean
+  loggedAt        DateTime @default(now())
+
+  teacher         Teacher  @relation(fields: [teacherId], references: [id])
+}
